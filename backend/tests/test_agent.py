@@ -11,7 +11,7 @@ def tool_use(id: str, name: str, /, **tool_input: Any) -> SimpleNamespace:
     """Mimics an SDK ToolUseBlock: the loop only reads these four attributes.
 
     The `/` makes id and name positional-only, so a tool input field called
-    `name` (as in click's role/name) lands in **tool_input instead of clashing.
+    `name` would land in **tool_input instead of clashing with the tool's name.
     """
     return SimpleNamespace(type="tool_use", id=id, name=name, input=tool_input)
 
@@ -46,21 +46,21 @@ class FakeClient:
 
 
 class FakeBrowser:
-    """Stands in for BrowserSession. Clicking a button named "Broken" fails."""
+    """Stands in for BrowserSession. Clicking ref "e99" fails."""
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
 
     def snapshot(self) -> str:
-        return '- button "OK"'
+        return '[e1] button "OK"'
 
-    def click(self, role: str, name: str) -> None:
-        self.calls.append(("click", role, name))
-        if name == "Broken":
+    def click(self, ref: str) -> None:
+        self.calls.append(("click", ref))
+        if ref == "e99":
             raise PlaywrightError("Timeout 5000ms exceeded.\nCall log: ...")
 
-    def type_text(self, role: str, name: str, text: str) -> None:
-        self.calls.append(("type_text", role, name, text))
+    def type_text(self, ref: str, text: str) -> None:
+        self.calls.append(("type_text", ref, text))
 
 
 def test_finish_returns_verdict() -> None:
@@ -79,13 +79,11 @@ def test_first_message_has_goal_and_snapshot() -> None:
     first = client.history[0]
     assert first["role"] == "user"
     assert "Log in" in first["content"]
-    assert '- button "OK"' in first["content"]
+    assert '[e1] button "OK"' in first["content"]
 
 
 def test_step_limit_reached() -> None:
-    client = FakeClient(
-        [[tool_use("t1", "click", role="button", name="OK")]], repeat_last=True
-    )
+    client = FakeClient([[tool_use("t1", "click", ref="e1")]], repeat_last=True)
     result = _run_loop(client, FakeBrowser(), "goal", max_steps=3)
     assert result.model_dump() == {
         "passed": False,
@@ -99,8 +97,8 @@ def test_results_then_one_snapshot_in_single_user_message() -> None:
     client = FakeClient(
         [
             [
-                tool_use("a", "type_text", role="textbox", name="Email", text="x@y"),
-                tool_use("b", "click", role="button", name="OK"),
+                tool_use("a", "type_text", ref="e2", text="x@y"),
+                tool_use("b", "click", ref="e1"),
             ],
             [tool_use("c", "finish", passed=True, reason="done")],
         ]
@@ -110,8 +108,8 @@ def test_results_then_one_snapshot_in_single_user_message() -> None:
 
     assert result.steps == 2
     assert browser.calls == [
-        ("type_text", "textbox", "Email", "x@y"),
-        ("click", "button", "OK"),
+        ("type_text", "e2", "x@y"),
+        ("click", "e1"),
     ]
     reply = client.history[2]  # [first user, assistant, tool results]
     assert reply["role"] == "user"
@@ -119,15 +117,15 @@ def test_results_then_one_snapshot_in_single_user_message() -> None:
     assert [r["tool_use_id"] for r in results] == ["a", "b"]
     assert all(r["type"] == "tool_result" and not r["is_error"] for r in results)
     assert snapshot["type"] == "text"
-    assert '- button "OK"' in snapshot["text"]
+    assert '[e1] button "OK"' in snapshot["text"]
 
 
 def test_failure_skips_rest_of_turn_including_finish() -> None:
     client = FakeClient(
         [
             [
-                tool_use("a", "click", role="button", name="Broken"),
-                tool_use("b", "click", role="button", name="OK"),
+                tool_use("a", "click", ref="e99"),
+                tool_use("b", "click", ref="e1"),
                 tool_use("c", "finish", passed=True, reason="too early"),
             ],
             [tool_use("d", "finish", passed=False, reason="button broken")],
@@ -142,7 +140,7 @@ def test_failure_skips_rest_of_turn_including_finish() -> None:
         "reason": "button broken",
         "steps": 2,
     }
-    assert browser.calls == [("click", "button", "Broken")]
+    assert browser.calls == [("click", "e99")]
     results = client.history[2]["content"][:-1]
     assert [r["tool_use_id"] for r in results] == ["a", "b", "c"]
     assert results[0]["content"] == "Error: Timeout 5000ms exceeded."

@@ -1,16 +1,28 @@
 """Browser tools: the agent's hands and eyes.
 
 Wraps Playwright so the rest of Argus can open pages, read them as
-accessibility snapshots, click, and type, without knowing Playwright details.
+element-ref snapshots, click, and type, without knowing Playwright details.
 """
 
+import re
+from pathlib import Path
 from typing import Self
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import Locator, sync_playwright
 
 ACTION_TIMEOUT_MS = (
     5_000  # Fail fast: don't wait 30s (Playwright's default) for a missing element
 )
+MAX_SNAPSHOT_CHARS = 6_000  # Keeps each snapshot to roughly 1.5k tokens
+
+# The snapshot script lives in its own .js file so it gets JavaScript syntax
+# highlighting and can be read on its own. Loaded once, when this module is imported.
+_SNAPSHOT_JS = Path(__file__).with_name("snapshot.js").read_text(encoding="utf-8")
+_REF_PATTERN = re.compile(r"e\d+")
+
+
+class ElementNotFoundError(Exception):
+    """The model used a ref that isn't on the page (stale, mistyped, or made up)."""
 
 
 class BrowserSession:
@@ -27,22 +39,35 @@ class BrowserSession:
 
     # ── Eyes ─────────────────────────────────────────────────────────
     def snapshot(self) -> str:
-        """Return the page as an accessibility snapshot (what the agent 'sees')."""
-        return self.page.locator("body").aria_snapshot()
+        """Return a compact outline of the page (what the agent 'sees').
+
+        Each interactive element is listed as `[eN] role "name"` and tagged in the
+        page with a matching data-argus-ref attribute. Refs are reassigned on every
+        call, so only the refs from the latest snapshot are valid.
+        """
+        return self.page.evaluate(_SNAPSHOT_JS, MAX_SNAPSHOT_CHARS)
 
     # ── Hands ────────────────────────────────────────────────────────
     def goto(self, url: str) -> None:
         self.page.goto(url)
 
-    def click(self, role: str, name: str) -> None:
-        self.page.get_by_role(role, name=name, exact=True).click(
-            timeout=ACTION_TIMEOUT_MS
-        )
+    def click(self, ref: str) -> None:
+        self._ref_locator(ref).click(timeout=ACTION_TIMEOUT_MS)
 
-    def type_text(self, role: str, name: str, text: str) -> None:
-        self.page.get_by_role(role, name=name, exact=True).fill(
-            text, timeout=ACTION_TIMEOUT_MS
-        )
+    def type_text(self, ref: str, text: str) -> None:
+        self._ref_locator(ref).fill(text, timeout=ACTION_TIMEOUT_MS)
+
+    def _ref_locator(self, ref: str) -> Locator:
+        """Find the element tagged with `ref`, or explain why it can't be found."""
+        # Checking the format first also stops a model-supplied string from
+        # breaking out of the CSS selector below.
+        locator = self.page.locator(f'[data-argus-ref="{ref}"]')
+        if not _REF_PATTERN.fullmatch(ref) or locator.count() == 0:
+            raise ElementNotFoundError(
+                f"No element with ref {ref!r}. Refs change after every snapshot; "
+                "use a ref from the latest snapshot."
+            )
+        return locator
 
     # ── Cleanup ──────────────────────────────────────────────────────
     def close(self) -> None:

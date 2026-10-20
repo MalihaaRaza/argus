@@ -26,3 +26,8 @@ dev = [
     "pytest>=9.1.1",
     "ruff>=0.17.1",
 ]
+
+[tool.pytest.ini_options]
+markers = [
+    "browser: launches a real Chromium (deselect with -m 'not browser')",
+]

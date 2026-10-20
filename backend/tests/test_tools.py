@@ -1,5 +1,6 @@
 from playwright.sync_api import Error as PlaywrightError
 
+from argus.browser import ElementNotFoundError
 from argus.tools import ERROR_PREFIX, TOOLS, execute_tool
 
 
@@ -10,13 +11,13 @@ class FakeBrowser:
         self.calls: list[tuple] = []
         self.error = error
 
-    def click(self, role: str, name: str) -> None:
-        self.calls.append(("click", role, name))
+    def click(self, ref: str) -> None:
+        self.calls.append(("click", ref))
         if self.error:
             raise self.error
 
-    def type_text(self, role: str, name: str, text: str) -> None:
-        self.calls.append(("type_text", role, name, text))
+    def type_text(self, ref: str, text: str) -> None:
+        self.calls.append(("type_text", ref, text))
         if self.error:
             raise self.error
 
@@ -25,28 +26,38 @@ def test_tool_names() -> None:
     assert [tool["name"] for tool in TOOLS] == ["click", "type_text", "finish"]
 
 
+def test_browser_tools_take_a_ref() -> None:
+    schemas = {tool["name"]: tool["input_schema"] for tool in TOOLS}
+    assert schemas["click"]["required"] == ["ref"]
+    assert schemas["type_text"]["required"] == ["ref", "text"]
+
+
 def test_click_calls_browser() -> None:
     browser = FakeBrowser()
-    result = execute_tool(browser, "click", {"role": "button", "name": "Sign in"})
-    assert browser.calls == [("click", "button", "Sign in")]
-    assert not result.startswith(ERROR_PREFIX)
+    result = execute_tool(browser, "click", {"ref": "e3"})
+    assert browser.calls == [("click", "e3")]
+    assert result == "Clicked e3."
 
 
 def test_type_text_calls_browser() -> None:
     browser = FakeBrowser()
-    result = execute_tool(
-        browser, "type_text", {"role": "textbox", "name": "Email", "text": "a@b"}
-    )
-    assert browser.calls == [("type_text", "textbox", "Email", "a@b")]
-    assert not result.startswith(ERROR_PREFIX)
+    result = execute_tool(browser, "type_text", {"ref": "e1", "text": "a@b"})
+    assert browser.calls == [("type_text", "e1", "a@b")]
+    assert result == "Typed into e1."
 
 
 def test_playwright_error_becomes_first_line_string() -> None:
     browser = FakeBrowser(
         error=PlaywrightError("Timeout 5000ms exceeded.\nCall log:\n  - waiting")
     )
-    result = execute_tool(browser, "click", {"role": "button", "name": "Nope"})
+    result = execute_tool(browser, "click", {"ref": "e1"})
     assert result == f"{ERROR_PREFIX}Timeout 5000ms exceeded."
+
+
+def test_unknown_ref_becomes_error_string() -> None:
+    browser = FakeBrowser(error=ElementNotFoundError("No element with ref 'e9'."))
+    result = execute_tool(browser, "click", {"ref": "e9"})
+    assert result == f"{ERROR_PREFIX}No element with ref 'e9'."
 
 
 def test_unknown_tool_is_error() -> None:
@@ -56,6 +67,6 @@ def test_unknown_tool_is_error() -> None:
 
 def test_missing_input_is_error() -> None:
     browser = FakeBrowser()
-    result = execute_tool(browser, "click", {"role": "button"})
+    result = execute_tool(browser, "type_text", {"ref": "e1"})
     assert result.startswith(ERROR_PREFIX)
     assert browser.calls == []
