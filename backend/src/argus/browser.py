@@ -4,9 +4,13 @@ Wraps Playwright so the rest of Argus can open pages, read them as
 accessibility snapshots, click, and type, without knowing Playwright details.
 """
 
+from typing import Self
+
 from playwright.sync_api import sync_playwright
 
-ACTION_TIMEOUT_MS = 5_000  # Fail fast: don't wait 30s (Playwright's default) for a missing element
+ACTION_TIMEOUT_MS = (
+    5_000  # Fail fast: don't wait 30s (Playwright's default) for a missing element
+)
 
 
 class BrowserSession:
@@ -16,7 +20,9 @@ class BrowserSession:
         # headless=False shows the browser window so you can watch the agent.
         # slow_mo adds a pause between actions so humans can follow along.
         self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(headless=headless, slow_mo=slow_mo_ms)
+        self._browser = self._playwright.chromium.launch(
+            headless=headless, slow_mo=slow_mo_ms
+        )
         self.page = self._browser.new_page()
 
     # ── Eyes ─────────────────────────────────────────────────────────
@@ -29,10 +35,14 @@ class BrowserSession:
         self.page.goto(url)
 
     def click(self, role: str, name: str) -> None:
-        self.page.get_by_role(role, name=name, exact=True).click(timeout=ACTION_TIMEOUT_MS)
+        self.page.get_by_role(role, name=name, exact=True).click(
+            timeout=ACTION_TIMEOUT_MS
+        )
 
     def type_text(self, role: str, name: str, text: str) -> None:
-        self.page.get_by_role(role, name=name, exact=True).fill(text, timeout=ACTION_TIMEOUT_MS)
+        self.page.get_by_role(role, name=name, exact=True).fill(
+            text, timeout=ACTION_TIMEOUT_MS
+        )
 
     # ── Cleanup ──────────────────────────────────────────────────────
     def close(self) -> None:
@@ -41,8 +51,8 @@ class BrowserSession:
 
     # These two methods make the class usable with `with`, which
     # guarantees close() runs even if an error happens mid-way.
-    def __enter__(self) -> "BrowserSession":
+    def __enter__(self) -> Self:
         return self
 
-    def __exit__(self, *exc_info) -> None:
+    def __exit__(self, *exc_info: object) -> None:
         self.close()
