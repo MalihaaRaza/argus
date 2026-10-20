@@ -46,13 +46,19 @@ class FakeClient:
 
 
 class FakeBrowser:
-    """Stands in for BrowserSession. Clicking ref "e99" fails."""
+    """Stands in for BrowserSession. Clicking ref "e99" fails; "e5" is a password field."""
 
     def __init__(self) -> None:
         self.calls: list[tuple] = []
 
     def snapshot(self) -> str:
         return '[e1] button "OK"'
+
+    def describe(self, ref: str) -> str | None:
+        return None  # Descriptions are covered in test_tools.py
+
+    def is_secret(self, ref: str) -> bool:
+        return ref == "e5"
 
     def click(self, ref: str) -> None:
         self.calls.append(("click", ref))
@@ -188,3 +194,23 @@ def test_finish_is_printed(capsys: pytest.CaptureFixture[str]) -> None:
     client = FakeClient([[tool_use("t1", "finish", passed=True, reason="done")]])
     _run_loop(client, FakeBrowser(), "goal", max_steps=5)
     assert "[step 1] finish(" in capsys.readouterr().out
+
+
+def test_password_is_masked_in_step_log(capsys: pytest.CaptureFixture[str]) -> None:
+    client = FakeClient(
+        [
+            [
+                tool_use("a", "type_text", ref="e4", text="standard_user"),
+                tool_use("b", "type_text", ref="e5", text="hunter2"),
+            ],
+            [tool_use("c", "finish", passed=True, reason="done")],
+        ]
+    )
+    browser = FakeBrowser()
+    _run_loop(client, browser, "goal", max_steps=5)
+
+    out = capsys.readouterr().out
+    assert "hunter2" not in out
+    assert "'text': '••••'" in out
+    assert "standard_user" in out  # Only password fields are masked
+    assert ("type_text", "e5", "hunter2") in browser.calls  # The real text is typed

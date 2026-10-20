@@ -6,7 +6,7 @@ element-ref snapshots, click, and type, without knowing Playwright details.
 
 import re
 from pathlib import Path
-from typing import Self
+from typing import Any, Self
 
 from playwright.sync_api import Locator, sync_playwright
 
@@ -36,6 +36,9 @@ class BrowserSession:
             headless=headless, slow_mo=slow_mo_ms
         )
         self.page = self._browser.new_page()
+        # Role, name and context of each ref in the latest snapshot, used to
+        # describe actions in human terms (see describe()).
+        self._refs: dict[str, dict[str, Any]] = {}
 
     # ── Eyes ─────────────────────────────────────────────────────────
     def snapshot(self) -> str:
@@ -45,7 +48,26 @@ class BrowserSession:
         page with a matching data-argus-ref attribute. Refs are reassigned on every
         call, so only the refs from the latest snapshot are valid.
         """
-        return self.page.evaluate(_SNAPSHOT_JS, MAX_SNAPSHOT_CHARS)
+        result = self.page.evaluate(_SNAPSHOT_JS, MAX_SNAPSHOT_CHARS)
+        self._refs = result["refs"]
+        return result["text"]
+
+    def describe(self, ref: str) -> str | None:
+        """Describe a ref from the latest snapshot, e.g. 'button "Add to cart" in: Backpack'.
+
+        Returns None if the ref wasn't in the latest snapshot.
+        """
+        info = self._refs.get(ref)
+        if info is None:
+            return None
+        description = f'{info["role"]} "{info["name"]}"'
+        if info["context"]:
+            description += f" in: {info['context']}"
+        return description
+
+    def is_secret(self, ref: str) -> bool:
+        """True if the ref is a password field in the latest snapshot."""
+        return bool(self._refs.get(ref, {}).get("secret"))
 
     # ── Hands ────────────────────────────────────────────────────────
     def goto(self, url: str) -> None:

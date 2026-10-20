@@ -213,13 +213,15 @@
   let length = lines[0].length;
   let nextRef = 1;
   let shown = 0;
+  const refs = {}; // ref -> {role, name, context}, so Python can describe actions
   for (const item of items) {
     let line = item.line;
+    let context = "";
     const ref = `e${nextRef}`;
     if (item.kind === "element") {
       const sameName = byName.get(item.name);
       const state = stateOf(item.el);
-      const context = sameName.length > 1 || !item.name ? contextHint(item.el, sameName) : "";
+      context = sameName.length > 1 || !item.name ? contextHint(item.el, sameName) : "";
       line = `[${ref}] ${item.role} "${item.name}"`;
       if (state) line += ` ${state}`;
       if (context) line += ` (in: ${context})`;
@@ -227,6 +229,8 @@
     if (length + 1 + line.length > maxChars) break;
     if (item.kind === "element") {
       item.el.setAttribute(REF_ATTR, ref);
+      const secret = item.el.tagName === "INPUT" && item.el.type === "password";
+      refs[ref] = { role: item.role, name: item.name, context, secret };
       nextRef++;
     }
     lines.push(line);
@@ -234,5 +238,7 @@
     shown++;
   }
   if (shown < items.length) lines.push(`... (${items.length - shown} more items not shown)`);
-  return lines.join("\n");
+  // The text is what the model reads; refs is structured data for Python, so it
+  // never has to parse the text back apart.
+  return { text: lines.join("\n"), refs };
 };

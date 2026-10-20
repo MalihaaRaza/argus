@@ -83,11 +83,15 @@ def execute_tool(browser: BrowserSession, name: str, tool_input: dict[str, Any])
     """
     try:
         if name == "click":
+            # Describe first: the click may load a new page, but the log should
+            # say what the model chose from the snapshot it saw.
+            target = _target(browser, tool_input["ref"])
             browser.click(tool_input["ref"])
-            return f"Clicked {tool_input['ref']}."
+            return f"Clicked {target}."
         if name == "type_text":
+            target = _target(browser, tool_input["ref"])
             browser.type_text(tool_input["ref"], tool_input["text"])
-            return f"Typed into {tool_input['ref']}."
+            return f"Typed into {target}."
         return f"{ERROR_PREFIX}unknown tool {name!r}."
     except ElementNotFoundError as error:
         return f"{ERROR_PREFIX}{error}"
@@ -100,3 +104,9 @@ def execute_tool(browser: BrowserSession, name: str, tool_input: dict[str, Any])
         return f"{ERROR_PREFIX}{first_line}"
     except KeyError as error:
         return f"{ERROR_PREFIX}missing input field {error}."
+
+
+def _target(browser: BrowserSession, ref: str) -> str:
+    """'e6 (button "Add to cart" in: Backpack)', or just 'e6' for an unknown ref."""
+    description = browser.describe(ref)
+    return f"{ref} ({description})" if description else ref

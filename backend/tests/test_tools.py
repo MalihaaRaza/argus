@@ -10,6 +10,13 @@ class FakeBrowser:
     def __init__(self, error: Exception | None = None) -> None:
         self.calls: list[tuple] = []
         self.error = error
+        self.descriptions = {
+            "e1": 'textbox "Email"',
+            "e3": 'button "Add to cart" in: Backpack $29.99',
+        }
+
+    def describe(self, ref: str) -> str | None:
+        return self.descriptions.get(ref)
 
     def click(self, ref: str) -> None:
         self.calls.append(("click", ref))
@@ -36,14 +43,19 @@ def test_click_calls_browser() -> None:
     browser = FakeBrowser()
     result = execute_tool(browser, "click", {"ref": "e3"})
     assert browser.calls == [("click", "e3")]
-    assert result == "Clicked e3."
+    assert result == 'Clicked e3 (button "Add to cart" in: Backpack $29.99).'
+
+
+def test_unknown_ref_description_falls_back_to_ref() -> None:
+    result = execute_tool(FakeBrowser(), "click", {"ref": "e7"})
+    assert result == "Clicked e7."
 
 
 def test_type_text_calls_browser() -> None:
     browser = FakeBrowser()
     result = execute_tool(browser, "type_text", {"ref": "e1", "text": "a@b"})
     assert browser.calls == [("type_text", "e1", "a@b")]
-    assert result == "Typed into e1."
+    assert result == 'Typed into e1 (textbox "Email").'
 
 
 def test_playwright_error_becomes_first_line_string() -> None:

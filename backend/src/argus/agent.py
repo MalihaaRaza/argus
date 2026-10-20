@@ -105,7 +105,7 @@ def _run_loop(
                 if is_error:
                     failed = True
 
-            _print_step(step, call.name, call.input, result)
+            _print_step(step, call.name, _loggable(browser, call.input), result)
             results.append(
                 {
                     "type": "tool_result",
@@ -140,6 +140,17 @@ def _describe(error: ValidationError) -> str:
         f"{'.'.join(str(part) for part in issue['loc'])}: {issue['msg']}"
         for issue in error.errors()
     )
+
+
+def _loggable(browser: BrowserSession, tool_input: dict[str, Any]) -> dict[str, Any]:
+    """The tool input with text typed into password fields masked, safe to print.
+
+    Uses the refs of the latest snapshot, which is still the one the model chose
+    from: a new snapshot is only taken after all of this turn's tools have run.
+    """
+    if "text" in tool_input and browser.is_secret(tool_input.get("ref", "")):
+        return {**tool_input, "text": "••••"}
+    return tool_input
 
 
 def _print_step(step: int, name: str, tool_input: dict[str, Any], result: str) -> None:

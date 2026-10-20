@@ -69,6 +69,9 @@ def test_duplicate_names_get_distinct_refs_and_context(browser: BrowserSession) 
     assert 'link "Backpack" (in:' not in snapshot
 
     second = list(add_buttons)[1]
+    assert browser.describe(second) == 'button "Add to cart" in: Bike Light $9.99'
+    assert browser.describe(ref_for(snapshot, 'link "Backpack"')) == 'link "Backpack"'
+    assert browser.describe("e999") is None
     browser.click(second)
     assert browser.page.evaluate("document.body.dataset.added") == "Bike Light"
 
@@ -135,6 +138,8 @@ def test_type_text_fills_the_ref_and_shows_value(browser: BrowserSession) -> Non
         '<label for="pw">Password</label><input id="pw" type="password">'
     )
     snapshot = browser.snapshot()
+    assert browser.is_secret(ref_for(snapshot, '"Password"'))
+    assert not browser.is_secret(ref_for(snapshot, '"Email"'))
     browser.type_text(ref_for(snapshot, '"Email"'), "a@b.c")
     browser.type_text(ref_for(snapshot, '"Password"'), "hunter2")
 
@@ -157,6 +162,9 @@ def test_refs_are_renumbered_and_stale_refs_fail(browser: BrowserSession) -> Non
         browser.click("e1")  # Its element is gone
 
     assert ref_lines(browser.snapshot()) == {"e1": 'button "Second"'}
+    # Descriptions follow the latest snapshot too: e2 is gone, e1 is now "Second".
+    assert browser.describe("e1") == 'button "Second"'
+    assert browser.describe("e2") is None
     # The old e2 tag was cleared, so only one element carries a ref now.
     assert browser.page.locator("[data-argus-ref]").count() == 1
 
