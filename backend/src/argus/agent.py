@@ -7,8 +7,8 @@ from dotenv import load_dotenv
 from playwright.sync_api import Error as PlaywrightError
 from pydantic import ValidationError
 
-from argus.browser import BrowserSession
-from argus.models import RunResult
+from argus.browser import BrowserSession, NavigationError
+from argus.models import RunResult, Verdict
 from argus.tools import ERROR_PREFIX, TOOLS, execute_tool
 
 # Reads ANTHROPIC_API_KEY from .env into the environment, where the SDK looks for it.
@@ -36,11 +36,32 @@ Rules:
 
 
 def run_agent(url: str, goal: str, max_steps: int = 15) -> RunResult:
-    """Open the page and let Claude test it against the goal."""
+    """Open the page and let Claude test it against the goal.
+
+    Never raises for infrastructure problems: those become status="error", so a
+    broken environment is never confused with a broken app.
+    """
     client = anthropic.Anthropic()
-    with BrowserSession() as browser:
-        browser.goto(url)
-        return _run_loop(client, browser, goal, max_steps)
+    if client.api_key is None and client.auth_token is None:
+        # Without credentials the SDK raises a plain TypeError on the first request.
+        # Checking up front gives a clear message and skips launching the browser.
+        return RunResult(
+            status="error",
+            reason="ANTHROPIC_API_KEY is not set; add it to backend/.env",
+            steps=0,
+        )
+    try:
+        with BrowserSession() as browser:
+            browser.goto(url)
+            return _run_loop(client, browser, goal, max_steps)
+    except NavigationError as error:
+        return RunResult(status="error", reason=str(error), steps=0)
+    except PlaywrightError as error:
+        # E.g. Chromium isn't installed or crashed. The loop itself turns browser
+        # errors into tool results, so this only catches setup and teardown.
+        return RunResult(
+            status="error", reason=f"Browser error: {_short(error)}", steps=0
+        )
 
 
 def _run_loop(
@@ -55,13 +76,23 @@ def _run_loop(
     ]
 
     for step in range(1, max_steps + 1):
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=MAX_TOKENS,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
-        )
+        try:
+            response = client.messages.create(
+                model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=SYSTEM_PROMPT,
+                tools=TOOLS,
+                messages=messages,
+            )
+        except anthropic.AnthropicError as error:
+            # The SDK already retries connection errors, 429s and 5xx responses
+            # (twice, with backoff) before raising, so this isn't a passing blip.
+            # Caught here, not in run_agent, because only here do we know the step.
+            return RunResult(
+                status="error",
+                reason=f"Anthropic API error: {_short(error)}",
+                steps=step - 1,
+            )
         messages.append({"role": "assistant", "content": response.content})
 
         tool_calls = [block for block in response.content if block.type == "tool_use"]
@@ -90,15 +121,18 @@ def _run_loop(
                 )
             elif call.name == "finish":
                 try:
-                    # Our step count goes last so the model can't override it.
-                    verdict = RunResult.model_validate({**call.input, "steps": step})
+                    verdict = Verdict.model_validate(call.input)
                 except ValidationError as error:
                     # Malformed verdict: tell Claude what was wrong so it can retry.
                     result = f"{ERROR_PREFIX}invalid finish input: {_describe(error)}"
                     is_error = failed = True
                 else:
                     _print_step(step, call.name, call.input, "run finished")
-                    return verdict
+                    return RunResult(
+                        status="passed" if verdict.passed else "failed",
+                        reason=verdict.reason,
+                        steps=step,
+                    )
             else:
                 result = execute_tool(browser, call.name, call.input)
                 is_error = result.startswith(ERROR_PREFIX)
@@ -123,7 +157,8 @@ def _run_loop(
         }
         messages.append({"role": "user", "content": results + [snapshot_block]})
 
-    return RunResult(passed=False, reason="step limit reached", steps=max_steps)
+    # No verdict means Argus couldn't complete the test; it says nothing about the app.
+    return RunResult(status="error", reason="step limit reached", steps=max_steps)
 
 
 def _snapshot_text(browser: BrowserSession) -> str:
@@ -132,6 +167,13 @@ def _snapshot_text(browser: BrowserSession) -> str:
         return browser.snapshot()
     except PlaywrightError as error:
         return f"{ERROR_PREFIX}could not take snapshot: {error}"
+
+
+def _short(error: Exception) -> str:
+    """First line of an error message, capped, so results stay readable."""
+    lines = str(error).strip().splitlines()
+    text = lines[0] if lines else type(error).__name__
+    return text if len(text) <= 200 else text[:199] + "…"
 
 
 def _describe(error: ValidationError) -> str:

@@ -5,10 +5,14 @@ element-ref snapshots, click, and type, without knowing Playwright details.
 """
 
 import re
+import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, Self
 
-from playwright.sync_api import Locator, sync_playwright
+from playwright.sync_api import Error as PlaywrightError
+from playwright.sync_api import Locator, Page, sync_playwright
+from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 
 ACTION_TIMEOUT_MS = (
     5_000  # Fail fast: don't wait 30s (Playwright's default) for a missing element
@@ -21,8 +25,71 @@ _SNAPSHOT_JS = Path(__file__).with_name("snapshot.js").read_text(encoding="utf-8
 _REF_PATTERN = re.compile(r"e\d+")
 
 
+RETRY_DELAYS_S = (1, 3)  # Wait before the 2nd and 3rd navigation attempts
+
+# Chromium network errors that are often temporary (a blip, a server restarting).
+# Anything else, like ERR_NAME_NOT_RESOLVED (usually a typo in the URL), fails at once.
+TRANSIENT_NET_ERRORS = (
+    "ERR_ABORTED",
+    "ERR_TIMED_OUT",
+    "ERR_CONNECTION_RESET",
+    "ERR_CONNECTION_CLOSED",
+    "ERR_CONNECTION_REFUSED",
+    "ERR_NETWORK_CHANGED",
+    "ERR_EMPTY_RESPONSE",
+)
+
+
 class ElementNotFoundError(Exception):
     """The model used a ref that isn't on the page (stale, mistyped, or made up)."""
+
+
+class NavigationError(Exception):
+    """The page couldn't be opened, even after retrying."""
+
+
+def navigate_with_retry(
+    page: Page,
+    url: str,
+    delays: Sequence[float] = RETRY_DELAYS_S,
+    sleep: Callable[[float], None] = time.sleep,
+) -> None:
+    """Open `url`, retrying transient failures once per entry in `delays`.
+
+    `page` and `sleep` are parameters so tests can pass fakes and check the
+    backoff without actually waiting.
+    """
+    attempts = len(delays) + 1
+    for attempt in range(1, attempts + 1):
+        try:
+            page.goto(url)
+            return
+        except PlaywrightError as error:
+            reason = _first_line(error)
+            if not _is_transient(error):
+                raise NavigationError(f"Could not open {url}: {reason}") from error
+            if attempt == attempts:
+                raise NavigationError(
+                    f"Could not open {url}: {reason} (after {attempts} attempts)"
+                ) from error
+            delay = delays[attempt - 1]
+            print(
+                f"Navigation to {url} failed ({reason}); retrying in {delay}s "
+                f"(attempt {attempt + 1} of {attempts})"
+            )
+            sleep(delay)
+
+
+def _is_transient(error: PlaywrightError) -> bool:
+    if isinstance(error, PlaywrightTimeoutError):
+        return True
+    return any(code in str(error) for code in TRANSIENT_NET_ERRORS)
+
+
+def _first_line(error: Exception) -> str:
+    # Playwright messages end with a long call log; the first line is the useful part.
+    lines = str(error).strip().splitlines()
+    return lines[0] if lines else type(error).__name__
 
 
 class BrowserSession:
@@ -71,7 +138,8 @@ class BrowserSession:
 
     # ── Hands ────────────────────────────────────────────────────────
     def goto(self, url: str) -> None:
-        self.page.goto(url)
+        """Open `url`, retrying transient errors. Raises NavigationError if it can't."""
+        navigate_with_retry(self.page, url)
 
     def click(self, ref: str) -> None:
         self._ref_locator(ref).click(timeout=ACTION_TIMEOUT_MS)

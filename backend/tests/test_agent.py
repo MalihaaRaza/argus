@@ -1,10 +1,13 @@
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Self
 
+import anthropic
 import pytest
 from playwright.sync_api import Error as PlaywrightError
 
-from argus.agent import _run_loop
+import argus.agent
+from argus.agent import _run_loop, run_agent
+from argus.browser import NavigationError
 
 
 def tool_use(id: str, name: str, /, **tool_input: Any) -> SimpleNamespace:
@@ -21,10 +24,13 @@ def text(value: str) -> SimpleNamespace:
 
 
 class FakeClient:
-    """Stands in for anthropic.Anthropic: replays scripted turns, one per create()."""
+    """Stands in for anthropic.Anthropic: replays scripted turns, one per create().
+
+    A turn can also be an exception, which create() raises (to simulate API errors).
+    """
 
     def __init__(
-        self, turns: list[list[SimpleNamespace]], repeat_last: bool = False
+        self, turns: list[list[SimpleNamespace] | Exception], repeat_last: bool = False
     ) -> None:
         self.turns = turns
         self.repeat_last = repeat_last
@@ -36,7 +42,10 @@ class FakeClient:
         index = len(self.calls) - 1
         if self.repeat_last:
             index = min(index, len(self.turns) - 1)
-        return SimpleNamespace(content=self.turns[index])
+        turn = self.turns[index]
+        if isinstance(turn, Exception):
+            raise turn
+        return SimpleNamespace(content=turn)
 
     @property
     def history(self) -> list[dict[str, Any]]:
@@ -74,6 +83,7 @@ def test_finish_returns_verdict() -> None:
         [[tool_use("t1", "finish", passed=True, reason="OK button visible")]]
     )
     result = _run_loop(client, FakeBrowser(), "goal", max_steps=5)
+    assert result.status == "passed"
     assert result.passed is True
     assert result.reason == "OK button visible"
     assert result.steps == 1
@@ -91,8 +101,9 @@ def test_first_message_has_goal_and_snapshot() -> None:
 def test_step_limit_reached() -> None:
     client = FakeClient([[tool_use("t1", "click", ref="e1")]], repeat_last=True)
     result = _run_loop(client, FakeBrowser(), "goal", max_steps=3)
+    # No verdict is an Argus problem, not an app failure.
     assert result.model_dump() == {
-        "passed": False,
+        "status": "error",
         "reason": "step limit reached",
         "steps": 3,
     }
@@ -142,7 +153,7 @@ def test_failure_skips_rest_of_turn_including_finish() -> None:
 
     # The finish in turn 1 came after a failure, so it must not end the run.
     assert result.model_dump() == {
-        "passed": False,
+        "status": "failed",
         "reason": "button broken",
         "steps": 2,
     }
@@ -178,7 +189,7 @@ def test_malformed_finish_is_returned_as_error() -> None:
     result = _run_loop(client, FakeBrowser(), "goal", max_steps=5)
 
     assert result.model_dump() == {
-        "passed": True,
+        "status": "passed",
         "reason": "retried with a reason",
         "steps": 2,
     }
@@ -214,3 +225,69 @@ def test_password_is_masked_in_step_log(capsys: pytest.CaptureFixture[str]) -> N
     assert "'text': '••••'" in out
     assert "standard_user" in out  # Only password fields are masked
     assert ("type_text", "e5", "hunter2") in browser.calls  # The real text is typed
+
+
+def test_api_error_becomes_error_result() -> None:
+    client = FakeClient(
+        [
+            [tool_use("a", "click", ref="e1")],
+            anthropic.AnthropicError("Overloaded\nmore details"),
+        ]
+    )
+    result = _run_loop(client, FakeBrowser(), "goal", max_steps=5)
+    assert result.model_dump() == {
+        "status": "error",
+        "reason": "Anthropic API error: Overloaded",
+        "steps": 1,  # Only the first model call completed
+    }
+
+
+class FailingSession:
+    """Stands in for BrowserSession in run_agent: navigation always fails."""
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        pass
+
+    def goto(self, url: str) -> None:
+        raise NavigationError(
+            f"Could not open {url}: net::ERR_ABORTED (after 3 attempts)"
+        )
+
+
+class UnlaunchableSession:
+    def __init__(self) -> None:
+        raise PlaywrightError(
+            "Executable doesn't exist at /chromium\nRun playwright install"
+        )
+
+
+def test_run_agent_navigation_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr(argus.agent, "BrowserSession", FailingSession)
+    result = run_agent("https://shop.test", "goal")
+    assert result.model_dump() == {
+        "status": "error",
+        "reason": "Could not open https://shop.test: net::ERR_ABORTED (after 3 attempts)",
+        "steps": 0,
+    }
+
+
+def test_run_agent_browser_launch_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.setattr(argus.agent, "BrowserSession", UnlaunchableSession)
+    result = run_agent("https://shop.test", "goal")
+    assert result.status == "error"
+    assert result.reason == "Browser error: Executable doesn't exist at /chromium"
+
+
+def test_run_agent_without_api_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    # Would fail the test if reached: the key check must come before the browser.
+    monkeypatch.setattr(argus.agent, "BrowserSession", UnlaunchableSession)
+    result = run_agent("https://shop.test", "goal")
+    assert result.status == "error"
+    assert "ANTHROPIC_API_KEY" in result.reason
