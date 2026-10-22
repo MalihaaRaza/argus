@@ -14,6 +14,7 @@ and any non-obvious code. Prefer clear, simple code over clever code.
 - `docs/decisions/` — short records of design decisions
 
 ## Commands (run from `backend/`)
+- Start Postgres and Redis (from repo root): `docker compose up -d`
 - Install dependencies: `uv sync`
 - Run the agent: `uv run argus "<url>" "<goal>"`
 - Tests: `uv run pytest`
