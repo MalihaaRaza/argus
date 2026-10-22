@@ -19,6 +19,8 @@ and any non-obvious code. Prefer clear, simple code over clever code.
 - Apply database migrations: `uv run alembic upgrade head`
 - Create a migration after changing models: `uv run alembic revision --autogenerate -m "..."`
 - Run the agent: `uv run argus "<url>" "<goal>"`
+- Run the API in dev mode (auto-reload; docs at http://127.0.0.1:8000/docs):
+  `uv run fastapi dev src/argus/api.py`
 - Tests: `uv run pytest`
 - Lint and format: `uv run ruff check . && uv run ruff format .`
 

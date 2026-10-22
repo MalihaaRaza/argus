@@ -1,6 +1,6 @@
 """Models against a real Postgres, in a separate argus_test database.
 
-Skipped when .env is missing or Postgres isn't reachable (`docker compose up -d`).
+The test_url and engine fixtures live in conftest.py.
 """
 
 import asyncio
@@ -8,57 +8,15 @@ import uuid
 from collections.abc import Iterator
 
 import pytest
-from pydantic import ValidationError
-from sqlalchemy import Engine, create_engine, delete, func, select, text
-from sqlalchemy.engine import URL, make_url
-from sqlalchemy.exc import IntegrityError, OperationalError
+from sqlalchemy import Engine, delete, func, select, text
+from sqlalchemy.engine import URL
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.orm import Session
 
-from argus.config import get_settings
-from argus.db import Base, Run, RunStep
+from argus.db import Run, RunStep
 
 pytestmark = pytest.mark.db
-
-TEST_DB = "argus_test"
-
-
-@pytest.fixture(scope="session")
-def test_url() -> URL:
-    try:
-        main_url = make_url(get_settings().database_url)
-    except ValidationError:
-        pytest.skip("DATABASE_URL is not set")
-
-    # CREATE DATABASE can't run inside a transaction, hence AUTOCOMMIT. We connect
-    # to the main database because we can't connect to one that doesn't exist yet.
-    admin = create_engine(
-        main_url, isolation_level="AUTOCOMMIT", connect_args={"connect_timeout": 3}
-    )
-    try:
-        with admin.connect() as conn:
-            exists = conn.scalar(
-                text("SELECT 1 FROM pg_database WHERE datname = :name"),
-                {"name": TEST_DB},
-            )
-            if not exists:
-                conn.execute(text(f'CREATE DATABASE "{TEST_DB}"'))
-    except OperationalError:
-        pytest.skip("Postgres is not reachable")
-    finally:
-        admin.dispose()
-
-    return main_url.set(database=TEST_DB)
-
-
-@pytest.fixture(scope="session")
-def engine(test_url: URL) -> Iterator[Engine]:
-    engine = create_engine(test_url)
-    # Fresh tables for every test session, so leftovers from a crashed run don't matter.
-    Base.metadata.drop_all(engine)
-    Base.metadata.create_all(engine)
-    yield engine
-    engine.dispose()
 
 
 @pytest.fixture

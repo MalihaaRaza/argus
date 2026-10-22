@@ -1,0 +1,100 @@
+"""HTTP API for creating and reading runs.
+
+Runs created here stay "queued" until a worker picks them up (added in a later step).
+"""
+
+import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Annotated
+from uuid import UUID
+
+from fastapi import Depends, FastAPI, HTTPException, Query, status
+from fastapi.responses import JSONResponse
+from sqlalchemy import select, text
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
+
+from argus.db import Run, get_async_engine, get_async_sessionmaker
+from argus.schemas import RunCreate, RunDetailOut, RunOut
+
+HEALTH_TIMEOUT_SECONDS = 3
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    yield
+    # On shutdown, close pooled database connections cleanly.
+    await get_async_engine().dispose()
+
+
+app = FastAPI(title="Argus", lifespan=lifespan)
+
+
+async def get_session() -> AsyncIterator[AsyncSession]:
+    """One session per request, closed when the request ends.
+
+    Endpoints receive it through Depends(), which lets tests swap in a session
+    for the test database via app.dependency_overrides.
+    """
+    async with get_async_sessionmaker()() as session:
+        yield session
+
+
+SessionDep = Annotated[AsyncSession, Depends(get_session)]
+
+
+# 202 Accepted: the run is recorded now and will be executed later by a worker.
+@app.post("/runs", status_code=status.HTTP_202_ACCEPTED)
+async def create_run(body: RunCreate, session: SessionDep) -> RunOut:
+    run = Run(url=str(body.url), goal=body.goal)
+    session.add(run)
+    await session.commit()
+    # created_at is set by Postgres. Reading it would trigger a lazy load, which
+    # async SQLAlchemy forbids (it would be hidden I/O), so fetch it explicitly.
+    await session.refresh(run)
+    return RunOut.model_validate(run)
+
+
+@app.get("/runs/{run_id}")
+async def get_run(run_id: UUID, session: SessionDep) -> RunDetailOut:
+    # selectinload fetches all steps in one extra query, up front, instead of
+    # lazily on first access (which async sessions don't allow).
+    run = await session.get(Run, run_id, options=[selectinload(Run.steps)])
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+    return RunDetailOut.model_validate(run)
+
+
+@app.get("/runs")
+async def list_runs(
+    session: SessionDep,
+    limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    offset: Annotated[int, Query(ge=0)] = 0,
+) -> list[RunOut]:
+    # Newest first. id breaks ties between equal timestamps, so pages don't
+    # overlap or skip rows when paginating.
+    query = (
+        select(Run)
+        .order_by(Run.created_at.desc(), Run.id.desc())
+        .limit(limit)
+        .offset(offset)
+    )
+    runs = await session.scalars(query)
+    return [RunOut.model_validate(run) for run in runs]
+
+
+@app.get("/health", response_model=None)
+async def health(session: SessionDep) -> dict[str, str] | JSONResponse:
+    try:
+        async with asyncio.timeout(HEALTH_TIMEOUT_SECONDS):
+            await session.execute(text("SELECT 1"))
+    except (SQLAlchemyError, OSError, TimeoutError):
+        # Report the outage as a normal response, not a crash: load balancers and
+        # monitors read the 503 status code.
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content={"status": "error", "database": "unreachable"},
+        )
+    return {"status": "ok", "database": "ok"}
