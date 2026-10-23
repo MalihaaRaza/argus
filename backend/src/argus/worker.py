@@ -12,11 +12,12 @@ Chromium and Playwright leave behind):
 """
 
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from celery.exceptions import SoftTimeLimitExceeded
 from celery.utils.log import get_task_logger
-from sqlalchemy import func, update
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from argus.agent import run_agent
@@ -50,12 +51,14 @@ def execute_run(run_id: str) -> None:
         return
 
     with get_sessionmaker()() as session:
-        if not _claim(session, run_uuid):
+        claimed = _claim(session, run_uuid)
+        if claimed is None:
             # Unknown id, or another delivery of this task already took the run.
             logger.info("Run %s is not queued; skipping", run_id)
             return
+        url, goal = claimed
         try:
-            _execute(session, run_uuid)
+            _execute(session, run_uuid, url, goal)
         except SoftTimeLimitExceeded:
             logger.error("Run %s hit the time limit", run_id)
             _mark_error(session, run_uuid, "time limit exceeded")
@@ -64,24 +67,40 @@ def execute_run(run_id: str) -> None:
             _mark_error(session, run_uuid, f"unexpected error: {type(error).__name__}")
 
 
-def _claim(session: Session, run_id: uuid.UUID) -> bool:
-    """Move the run from "queued" to "running". Returns False if it wasn't queued.
+def _now() -> datetime:
+    """The current time, for recording when something happened.
 
-    Checking and setting happen in one UPDATE, so the database guarantees only one
-    caller can win. Reading the status first and then writing it would let two
-    deliveries of the same task both see "queued" and both run it.
+    Postgres's now() is the time the *transaction* started, not the time of the
+    statement, so it is wrong for events inside a long transaction. Event times
+    are therefore taken here, in Python, at the moment they happen.
     """
-    result = session.execute(
+    return datetime.now(UTC)
+
+
+def _claim(session: Session, run_id: uuid.UUID) -> tuple[str, str] | None:
+    """Move the run from "queued" to "running" and return its (url, goal).
+
+    Returns None if the run wasn't queued. Checking and setting happen in one
+    UPDATE, so the database guarantees only one caller can win. Reading the status
+    first and then writing it would let two deliveries of the same task both see
+    "queued" and both run it. RETURNING hands back what the agent needs in the same
+    statement, so no separate read (and no transaction) is left open afterwards.
+    """
+    row = session.execute(
         update(Run)
         .where(Run.id == run_id, Run.status == "queued")
-        .values(status="running", started_at=func.now())
-    )
+        .values(status="running", started_at=_now())
+        .returning(Run.url, Run.goal)
+    ).one_or_none()
     session.commit()
-    return result.rowcount == 1
+    return None if row is None else (row.url, row.goal)
 
 
-def _execute(session: Session, run_id: uuid.UUID) -> None:
-    run = session.get_one(Run, run_id)
+def _execute(session: Session, run_id: uuid.UUID, url: str, goal: str) -> None:
+    # Every database write below is its own short transaction that ends with a
+    # commit. Nothing stays open while the browser launches or Claude is thinking,
+    # which can take many seconds: an open transaction would hold a connection
+    # "idle in transaction" and pin now() to a stale time.
 
     def save_step(
         step: int,
@@ -100,19 +119,26 @@ def _execute(session: Session, run_id: uuid.UUID) -> None:
                 tool_input=tool_input,  # Already masked by the agent
                 result=result,
                 is_error=is_error,
+                created_at=_now(),  # When the step happened, not when a transaction began
             )
         )
-        run.step_count = step
+        session.execute(update(Run).where(Run.id == run_id).values(step_count=step))
         session.commit()
 
-    result = run_agent(run.url, run.goal, on_step=save_step)
+    result = run_agent(url, goal, on_step=save_step)
 
-    run.status = result.status
-    run.reason = result.reason
-    run.step_count = result.steps
-    run.input_tokens = result.input_tokens
-    run.output_tokens = result.output_tokens
-    run.finished_at = func.now()
+    session.execute(
+        update(Run)
+        .where(Run.id == run_id)
+        .values(
+            status=result.status,
+            reason=result.reason,
+            step_count=result.steps,
+            input_tokens=result.input_tokens,
+            output_tokens=result.output_tokens,
+            finished_at=_now(),
+        )
+    )
     session.commit()
 
 
@@ -123,6 +149,6 @@ def _mark_error(session: Session, run_id: uuid.UUID, reason: str) -> None:
     session.execute(
         update(Run)
         .where(Run.id == run_id)
-        .values(status="error", reason=reason, finished_at=func.now())
+        .values(status="error", reason=reason, finished_at=_now())
     )
     session.commit()

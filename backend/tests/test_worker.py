@@ -4,14 +4,16 @@ A real worker would send the task through Redis. Calling the task function direc
 runs the same code synchronously, which is all these tests need.
 """
 
+import time
 import uuid
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from typing import Any
 
 import pytest
 from celery.exceptions import SoftTimeLimitExceeded
 from fakes import FakeBrowser, FakeClient, tool_use
-from sqlalchemy import Engine
+from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 import argus.worker
@@ -194,3 +196,64 @@ def test_run_that_is_not_queued_is_skipped(
 @pytest.mark.parametrize("run_id", [str(uuid.uuid4()), "not-a-uuid"])
 def test_unknown_or_invalid_id_is_ignored(run_id: str) -> None:
     execute_run(run_id)  # Logs and returns; doesn't raise
+
+
+def test_step_times_are_when_steps_happen(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The first step comes after a slow start (in real runs: launching the browser
+    # and waiting for Claude). Steps used to get Postgres's now(), the start time of
+    # a transaction opened before that wait, so the first step was dated too early.
+    windows: list[tuple[datetime, datetime]] = []
+
+    def slow_agent(url: str, goal: str, on_step: StepCallback) -> RunResult:
+        for step in (1, 2):
+            time.sleep(0.3)
+            before = datetime.now(UTC)
+            on_step(step, "click", {"ref": "e1"}, "Clicked e1.", False)
+            windows.append((before, datetime.now(UTC)))
+        return RunResult(status="passed", reason="ok", steps=2)
+
+    monkeypatch.setattr(argus.worker, "run_agent", slow_agent)
+    run_id = add_run(engine)
+
+    execute_run(str(run_id))
+
+    run = load_run(engine, run_id)
+    for saved, (before, after) in zip(run.steps, windows, strict=True):
+        assert before <= saved.created_at <= after
+    assert run.started_at is not None and run.finished_at is not None
+    assert run.steps[0].created_at - run.started_at >= timedelta(seconds=0.3)
+    assert run.steps[-1].created_at <= run.finished_at
+
+
+def test_no_transaction_is_held_while_the_agent_runs(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def idle_transactions() -> int:
+        # Other connections to argus_test that sit inside an unfinished transaction.
+        with engine.connect() as conn:
+            return conn.scalar(
+                text(
+                    "SELECT count(*) FROM pg_stat_activity"
+                    " WHERE datname = current_database()"
+                    " AND state LIKE 'idle in transaction%'"
+                    " AND pid <> pg_backend_pid()"
+                )
+            )
+
+    seen: list[int] = []
+
+    def agent(url: str, goal: str, on_step: StepCallback) -> RunResult:
+        seen.append(idle_transactions())  # While the browser / Claude would work
+        on_step(1, "click", {"ref": "e1"}, "Clicked e1.", False)
+        seen.append(idle_transactions())  # Between steps
+        return RunResult(status="passed", reason="ok", steps=1)
+
+    monkeypatch.setattr(argus.worker, "run_agent", agent)
+    run_id = add_run(engine)
+
+    execute_run(str(run_id))
+
+    assert seen == [0, 0]
+    assert load_run(engine, run_id).status == "passed"

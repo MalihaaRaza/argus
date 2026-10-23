@@ -1,5 +1,7 @@
 """Navigation retry logic, tested with a fake page (no real browser needed)."""
 
+import logging
+
 import pytest
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
@@ -41,13 +43,15 @@ def test_success_needs_no_retry() -> None:
     assert sleep.delays == []
 
 
-def test_transient_error_then_success(capsys: pytest.CaptureFixture[str]) -> None:
+def test_transient_error_then_success(caplog: pytest.LogCaptureFixture) -> None:
     page, sleep = FakePage([ABORTED]), FakeSleep()
     navigate_with_retry(page, "https://shop.test", sleep=sleep)
 
     assert page.goto_calls == 2
     assert sleep.delays == [1]
-    out = capsys.readouterr().out
+    [record] = caplog.records
+    assert record.levelno == logging.WARNING
+    out = record.getMessage()
     assert "ERR_ABORTED" in out
     assert "retrying in 1s (attempt 2 of 3)" in out
     assert "Call log" not in out  # Only the first line of the error is shown

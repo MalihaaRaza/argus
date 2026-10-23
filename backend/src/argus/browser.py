@@ -4,6 +4,7 @@ Wraps Playwright so the rest of Argus can open pages, read them as
 element-ref snapshots, click, and type, without knowing Playwright details.
 """
 
+import logging
 import re
 import time
 from collections.abc import Callable, Sequence
@@ -13,6 +14,8 @@ from typing import Any, Self
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Locator, Page, sync_playwright
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+
+logger = logging.getLogger(__name__)
 
 ACTION_TIMEOUT_MS = (
     5_000  # Fail fast: don't wait 30s (Playwright's default) for a missing element
@@ -73,9 +76,13 @@ def navigate_with_retry(
                     f"Could not open {url}: {reason} (after {attempts} attempts)"
                 ) from error
             delay = delays[attempt - 1]
-            print(
-                f"Navigation to {url} failed ({reason}); retrying in {delay}s "
-                f"(attempt {attempt + 1} of {attempts})"
+            logger.warning(
+                "Navigation to %s failed (%s); retrying in %ss (attempt %d of %d)",
+                url,
+                reason,
+                delay,
+                attempt + 1,
+                attempts,
             )
             sleep(delay)
 

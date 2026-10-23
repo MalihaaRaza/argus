@@ -1,5 +1,6 @@
 """The agent loop: Claude looks at the page, picks a tool, we run it, repeat."""
 
+import logging
 from collections.abc import Callable
 from typing import Any
 
@@ -11,6 +12,8 @@ from pydantic import ValidationError
 from argus.browser import BrowserSession, NavigationError
 from argus.models import RunResult, Verdict
 from argus.tools import ERROR_PREFIX, TOOLS, execute_tool
+
+logger = logging.getLogger(__name__)
 
 # Reads ANTHROPIC_API_KEY from .env into the environment, where the SDK looks for it.
 load_dotenv()
@@ -52,6 +55,7 @@ def run_agent(
     if client.api_key is None and client.auth_token is None:
         # Without credentials the SDK raises a plain TypeError on the first request.
         # Checking up front gives a clear message and skips launching the browser.
+        logger.error("ANTHROPIC_API_KEY is not set")
         return RunResult(
             status="error",
             reason="ANTHROPIC_API_KEY is not set; add it to backend/.env",
@@ -62,10 +66,12 @@ def run_agent(
             browser.goto(url)
             return _run_loop(client, browser, goal, max_steps, on_step)
     except NavigationError as error:
+        logger.error("%s", error)
         return RunResult(status="error", reason=str(error), steps=0)
     except PlaywrightError as error:
         # E.g. Chromium isn't installed or crashed. The loop itself turns browser
         # errors into tool results, so this only catches setup and teardown.
+        logger.error("Browser error: %s", _short(error))
         return RunResult(
             status="error", reason=f"Browser error: {_short(error)}", steps=0
         )
@@ -103,6 +109,7 @@ def _run_loop(
             # The SDK already retries connection errors, 429s and 5xx responses
             # (twice, with backoff) before raising, so this isn't a passing blip.
             # Caught here, not in run_agent, because only here do we know the step.
+            logger.error("Anthropic API error at step %d: %s", step, _short(error))
             return RunResult(
                 status="error",
                 reason=f"Anthropic API error: {_short(error)}",
@@ -188,6 +195,7 @@ def _run_loop(
         messages.append({"role": "user", "content": results + [snapshot_block]})
 
     # No verdict means Argus couldn't complete the test; it says nothing about the app.
+    logger.error("Step limit (%d) reached without a verdict", max_steps)
     return RunResult(
         status="error",
         reason="step limit reached",
@@ -239,11 +247,13 @@ def _report_step(
     result: str,
     is_error: bool,
 ) -> None:
-    """Print the step, then pass it to on_step (e.g. the worker saving it).
+    """Log the step, then pass it to on_step (e.g. the worker saving it).
 
     Both get the same, already-masked input, so what's stored can never reveal
-    more than what's printed.
+    more than what's logged.
     """
-    print(f"[step {step}] {name}({tool_input}) -> {result}")
+    # INFO, even when the tool failed: a failed click is normal agent work (Claude
+    # sees the error and adapts), not a problem with Argus itself.
+    logger.info("[step %d] %s(%s) -> %s", step, name, tool_input, result)
     if on_step is not None:
         on_step(step, name, tool_input, result, is_error)

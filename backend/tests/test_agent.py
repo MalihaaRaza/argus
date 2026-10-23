@@ -1,3 +1,4 @@
+import logging
 from typing import Any, Self
 
 import anthropic
@@ -151,13 +152,29 @@ def test_malformed_finish_is_returned_as_error() -> None:
     )
 
 
-def test_finish_is_printed(capsys: pytest.CaptureFixture[str]) -> None:
+def test_steps_are_logged_at_info(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="argus")
     client = FakeClient([[tool_use("t1", "finish", passed=True, reason="done")]])
     _run_loop(client, FakeBrowser(), "goal", max_steps=5)
-    assert "[step 1] finish(" in capsys.readouterr().out
+
+    [record] = caplog.records
+    assert record.levelno == logging.INFO
+    assert record.getMessage().startswith("[step 1] finish(")
 
 
-def test_password_is_masked_in_step_log(capsys: pytest.CaptureFixture[str]) -> None:
+def test_step_limit_is_logged_as_error(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="argus")
+    client = FakeClient([[text("thinking...")]], repeat_last=True)
+    _run_loop(client, FakeBrowser(), "goal", max_steps=2)
+
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert [r.getMessage() for r in errors] == [
+        "Step limit (2) reached without a verdict"
+    ]
+
+
+def test_password_is_masked_in_step_log(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level(logging.INFO, logger="argus")
     client = FakeClient(
         [
             [
@@ -170,7 +187,7 @@ def test_password_is_masked_in_step_log(capsys: pytest.CaptureFixture[str]) -> N
     browser = FakeBrowser()
     _run_loop(client, browser, "goal", max_steps=5)
 
-    out = capsys.readouterr().out
+    out = caplog.text
     assert "hunter2" not in out
     assert "'text': '••••'" in out
     assert "standard_user" in out  # Only password fields are masked

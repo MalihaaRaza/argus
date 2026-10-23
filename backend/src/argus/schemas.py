@@ -5,7 +5,7 @@ can change independently (e.g. a new column doesn't automatically become public)
 """
 
 from datetime import datetime
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, HttpUrl, StringConstraints
@@ -57,3 +57,17 @@ class RunDetailOut(RunOut):
     """A run with its steps, for GET /runs/{run_id}."""
 
     steps: list[RunStepOut]
+
+
+class ErrorOut(BaseModel):
+    """The body FastAPI sends for an HTTPException, e.g. a 404."""
+
+    detail: str
+
+
+class HealthOut(BaseModel):
+    """GET /health. The same shape for 200 (all ok) and 503 (database unreachable),
+    so monitors can read the body either way."""
+
+    status: Literal["ok", "error"]
+    database: Literal["ok", "unreachable"]

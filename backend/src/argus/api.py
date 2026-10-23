@@ -20,7 +20,7 @@ from sqlalchemy.orm import selectinload
 
 from argus.celery_app import EXECUTE_RUN_TASK, celery_app
 from argus.db import Run, get_async_engine, get_async_sessionmaker
-from argus.schemas import RunCreate, RunDetailOut, RunOut
+from argus.schemas import ErrorOut, HealthOut, RunCreate, RunDetailOut, RunOut
 
 HEALTH_TIMEOUT_SECONDS = 3
 
@@ -82,7 +82,12 @@ async def create_run(body: RunCreate, session: SessionDep) -> RunOut:
     return RunOut.model_validate(run)
 
 
-@app.get("/runs/{run_id}")
+# `responses` only documents extra outcomes in the OpenAPI schema (and /docs);
+# FastAPI doesn't validate them. The 200 response comes from the return type.
+@app.get(
+    "/runs/{run_id}",
+    responses={404: {"model": ErrorOut, "description": "No run with this id"}},
+)
 async def get_run(run_id: UUID, session: SessionDep) -> RunDetailOut:
     # selectinload fetches all steps in one extra query, up front, instead of
     # lazily on first access (which async sessions don't allow).
@@ -110,8 +115,14 @@ async def list_runs(
     return [RunOut.model_validate(run) for run in runs]
 
 
-@app.get("/health", response_model=None)
-async def health(session: SessionDep) -> dict[str, str] | JSONResponse:
+# response_model is set explicitly because the return type also allows a
+# JSONResponse (the 503), which isn't a schema FastAPI could document.
+@app.get(
+    "/health",
+    response_model=HealthOut,
+    responses={503: {"model": HealthOut, "description": "The database is unreachable"}},
+)
+async def health(session: SessionDep) -> HealthOut | JSONResponse:
     try:
         async with asyncio.timeout(HEALTH_TIMEOUT_SECONDS):
             await session.execute(text("SELECT 1"))
@@ -120,6 +131,6 @@ async def health(session: SessionDep) -> dict[str, str] | JSONResponse:
         # monitors read the 503 status code.
         return JSONResponse(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            content={"status": "error", "database": "unreachable"},
+            content=HealthOut(status="error", database="unreachable").model_dump(),
         )
-    return {"status": "ok", "database": "ok"}
+    return HealthOut(status="ok", database="ok")
