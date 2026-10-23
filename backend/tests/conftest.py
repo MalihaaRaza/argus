@@ -8,12 +8,13 @@ from collections.abc import Iterator
 
 import pytest
 from pydantic import ValidationError
-from sqlalchemy import Engine, create_engine, text
+from sqlalchemy import Engine, create_engine, delete, text
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.orm import Session
 
 from argus.config import get_settings
-from argus.db import Base
+from argus.db import Base, Run
 
 TEST_DB = "argus_test"
 
@@ -54,3 +55,12 @@ def engine(test_url: URL) -> Iterator[Engine]:
     Base.metadata.create_all(engine)
     yield engine
     engine.dispose()
+
+
+@pytest.fixture
+def clean_db(engine: Engine) -> Iterator[None]:
+    """Deletes every run after the test, so tests don't see each other's rows."""
+    yield
+    with Session(engine) as session:
+        session.execute(delete(Run))  # Steps go too, via ON DELETE CASCADE
+        session.commit()

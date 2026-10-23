@@ -25,6 +25,9 @@ class RunResult(BaseModel):
     status: Literal["passed", "failed", "error"]
     reason: str
     steps: int  # Number of model calls the run completed
+    # Totals across all model calls, so each run's cost can be recorded.
+    input_tokens: int = 0
+    output_tokens: int = 0
 
     @property
     def passed(self) -> bool:

@@ -21,6 +21,10 @@ and any non-obvious code. Prefer clear, simple code over clever code.
 - Run the agent: `uv run argus "<url>" "<goal>"`
 - Run the API in dev mode (auto-reload; docs at http://127.0.0.1:8000/docs):
   `uv run fastapi dev src/argus/api.py`
+- Run the worker that executes queued runs (needs Redis; prefork is the only pool
+  that enforces the task time limits; --max-tasks-per-child restarts the process
+  every 20 runs to free memory left behind by Chromium):
+  `uv run celery -A argus.worker:celery_app worker --pool=prefork --concurrency=1 --max-tasks-per-child=20 --loglevel=info`
 - Tests: `uv run pytest`
 - Lint and format: `uv run ruff check . && uv run ruff format .`
 

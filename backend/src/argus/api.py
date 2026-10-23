@@ -1,9 +1,11 @@
 """HTTP API for creating and reading runs.
 
-Runs created here stay "queued" until a worker picks them up (added in a later step).
+Each new run is saved as "queued" and handed to the Celery worker (worker.py),
+which executes it and writes the progress back to the database.
 """
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Annotated
@@ -11,15 +13,18 @@ from uuid import UUID
 
 from fastapi import Depends, FastAPI, HTTPException, Query, status
 from fastapi.responses import JSONResponse
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from argus.celery_app import EXECUTE_RUN_TASK, celery_app
 from argus.db import Run, get_async_engine, get_async_sessionmaker
 from argus.schemas import RunCreate, RunDetailOut, RunOut
 
 HEALTH_TIMEOUT_SECONDS = 3
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -50,9 +55,29 @@ SessionDep = Annotated[AsyncSession, Depends(get_session)]
 async def create_run(body: RunCreate, session: SessionDep) -> RunOut:
     run = Run(url=str(body.url), goal=body.goal)
     session.add(run)
+    # Commit before enqueueing: a fast worker must find the row when it looks.
     await session.commit()
-    # created_at is set by Postgres. Reading it would trigger a lazy load, which
-    # async SQLAlchemy forbids (it would be hidden I/O), so fetch it explicitly.
+
+    try:
+        # Sending by name means the API never imports worker.py (and with it the
+        # agent, Playwright and the Anthropic SDK); it only publishes a message.
+        # send_task does blocking network I/O (and retries if Redis is down), so it
+        # runs in a thread to keep the event loop free for other requests.
+        await asyncio.to_thread(
+            celery_app.send_task, EXECUTE_RUN_TASK, args=[str(run.id)]
+        )
+    except Exception:
+        # Deliberately broad: whatever stopped the enqueue (Redis down, bad
+        # REDIS_URL, ...), the run must not sit in "queued" forever.
+        logger.exception("Could not queue run %s", run.id)
+        run.status = "error"
+        run.reason = "could not queue run"
+        run.finished_at = func.now()
+        await session.commit()
+
+    # created_at (and finished_at, if set above) are filled in by Postgres. Reading
+    # them would trigger a lazy load, which async SQLAlchemy forbids (it would be
+    # hidden I/O), so fetch them explicitly.
     await session.refresh(run)
     return RunOut.model_validate(run)
 

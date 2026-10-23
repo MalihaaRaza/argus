@@ -1,5 +1,6 @@
 """The agent loop: Claude looks at the page, picks a tool, we run it, repeat."""
 
+from collections.abc import Callable
 from typing import Any
 
 import anthropic
@@ -34,8 +35,14 @@ Rules:
 - When you have enough evidence, call finish with passed=true or passed=false and a
   short reason that cites what you saw on the page."""
 
+# Called after each tool call with (step, tool name, input, result, is_error).
+# The input is the masked one, the same as the printed log.
+StepCallback = Callable[[int, str, dict[str, Any], str, bool], None]
 
-def run_agent(url: str, goal: str, max_steps: int = 15) -> RunResult:
+
+def run_agent(
+    url: str, goal: str, max_steps: int = 15, on_step: StepCallback | None = None
+) -> RunResult:
     """Open the page and let Claude test it against the goal.
 
     Never raises for infrastructure problems: those become status="error", so a
@@ -53,7 +60,7 @@ def run_agent(url: str, goal: str, max_steps: int = 15) -> RunResult:
     try:
         with BrowserSession() as browser:
             browser.goto(url)
-            return _run_loop(client, browser, goal, max_steps)
+            return _run_loop(client, browser, goal, max_steps, on_step)
     except NavigationError as error:
         return RunResult(status="error", reason=str(error), steps=0)
     except PlaywrightError as error:
@@ -65,7 +72,11 @@ def run_agent(url: str, goal: str, max_steps: int = 15) -> RunResult:
 
 
 def _run_loop(
-    client: anthropic.Anthropic, browser: BrowserSession, goal: str, max_steps: int
+    client: anthropic.Anthropic,
+    browser: BrowserSession,
+    goal: str,
+    max_steps: int,
+    on_step: StepCallback | None = None,
 ) -> RunResult:
     """The decision loop. Takes its dependencies as arguments so tests can pass fakes."""
     messages: list[dict[str, Any]] = [
@@ -74,6 +85,10 @@ def _run_loop(
             "content": f"Goal: {goal}\n\nCurrent page snapshot:\n{_snapshot_text(browser)}",
         }
     ]
+    # Running totals, included in every result (even errors) so a run that went
+    # wrong still reports what it spent.
+    input_tokens = 0
+    output_tokens = 0
 
     for step in range(1, max_steps + 1):
         try:
@@ -92,7 +107,11 @@ def _run_loop(
                 status="error",
                 reason=f"Anthropic API error: {_short(error)}",
                 steps=step - 1,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
             )
+        input_tokens += response.usage.input_tokens
+        output_tokens += response.usage.output_tokens
         messages.append({"role": "assistant", "content": response.content})
 
         tool_calls = [block for block in response.content if block.type == "tool_use"]
@@ -127,11 +146,15 @@ def _run_loop(
                     result = f"{ERROR_PREFIX}invalid finish input: {_describe(error)}"
                     is_error = failed = True
                 else:
-                    _print_step(step, call.name, call.input, "run finished")
+                    _report_step(
+                        on_step, step, call.name, call.input, "run finished", False
+                    )
                     return RunResult(
                         status="passed" if verdict.passed else "failed",
                         reason=verdict.reason,
                         steps=step,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
                     )
             else:
                 result = execute_tool(browser, call.name, call.input)
@@ -139,7 +162,14 @@ def _run_loop(
                 if is_error:
                     failed = True
 
-            _print_step(step, call.name, _loggable(browser, call.input), result)
+            _report_step(
+                on_step,
+                step,
+                call.name,
+                _loggable(browser, call.input),
+                result,
+                is_error,
+            )
             results.append(
                 {
                     "type": "tool_result",
@@ -158,7 +188,13 @@ def _run_loop(
         messages.append({"role": "user", "content": results + [snapshot_block]})
 
     # No verdict means Argus couldn't complete the test; it says nothing about the app.
-    return RunResult(status="error", reason="step limit reached", steps=max_steps)
+    return RunResult(
+        status="error",
+        reason="step limit reached",
+        steps=max_steps,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
 
 
 def _snapshot_text(browser: BrowserSession) -> str:
@@ -195,5 +231,19 @@ def _loggable(browser: BrowserSession, tool_input: dict[str, Any]) -> dict[str, 
     return tool_input
 
 
-def _print_step(step: int, name: str, tool_input: dict[str, Any], result: str) -> None:
+def _report_step(
+    on_step: StepCallback | None,
+    step: int,
+    name: str,
+    tool_input: dict[str, Any],
+    result: str,
+    is_error: bool,
+) -> None:
+    """Print the step, then pass it to on_step (e.g. the worker saving it).
+
+    Both get the same, already-masked input, so what's stored can never reveal
+    more than what's printed.
+    """
     print(f"[step {step}] {name}({tool_input}) -> {result}")
+    if on_step is not None:
+        on_step(step, name, tool_input, result, is_error)

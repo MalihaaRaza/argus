@@ -1,8 +1,15 @@
-from types import SimpleNamespace
 from typing import Any, Self
 
 import anthropic
 import pytest
+from fakes import (
+    INPUT_TOKENS_PER_CALL,
+    OUTPUT_TOKENS_PER_CALL,
+    FakeBrowser,
+    FakeClient,
+    text,
+    tool_use,
+)
 from playwright.sync_api import Error as PlaywrightError
 
 import argus.agent
@@ -10,72 +17,12 @@ from argus.agent import _run_loop, run_agent
 from argus.browser import NavigationError
 
 
-def tool_use(id: str, name: str, /, **tool_input: Any) -> SimpleNamespace:
-    """Mimics an SDK ToolUseBlock: the loop only reads these four attributes.
-
-    The `/` makes id and name positional-only, so a tool input field called
-    `name` would land in **tool_input instead of clashing with the tool's name.
-    """
-    return SimpleNamespace(type="tool_use", id=id, name=name, input=tool_input)
-
-
-def text(value: str) -> SimpleNamespace:
-    return SimpleNamespace(type="text", text=value)
-
-
-class FakeClient:
-    """Stands in for anthropic.Anthropic: replays scripted turns, one per create().
-
-    A turn can also be an exception, which create() raises (to simulate API errors).
-    """
-
-    def __init__(
-        self, turns: list[list[SimpleNamespace] | Exception], repeat_last: bool = False
-    ) -> None:
-        self.turns = turns
-        self.repeat_last = repeat_last
-        self.calls: list[dict[str, Any]] = []
-        self.messages = self  # so client.messages.create(...) resolves to self.create
-
-    def create(self, **kwargs: Any) -> SimpleNamespace:
-        self.calls.append(kwargs)
-        index = len(self.calls) - 1
-        if self.repeat_last:
-            index = min(index, len(self.turns) - 1)
-        turn = self.turns[index]
-        if isinstance(turn, Exception):
-            raise turn
-        return SimpleNamespace(content=turn)
-
-    @property
-    def history(self) -> list[dict[str, Any]]:
-        # The loop passes the same list object on every call and keeps appending to it,
-        # so the last call's messages is the full conversation.
-        return self.calls[-1]["messages"]
-
-
-class FakeBrowser:
-    """Stands in for BrowserSession. Clicking ref "e99" fails; "e5" is a password field."""
-
-    def __init__(self) -> None:
-        self.calls: list[tuple] = []
-
-    def snapshot(self) -> str:
-        return '[e1] button "OK"'
-
-    def describe(self, ref: str) -> str | None:
-        return None  # Descriptions are covered in test_tools.py
-
-    def is_secret(self, ref: str) -> bool:
-        return ref == "e5"
-
-    def click(self, ref: str) -> None:
-        self.calls.append(("click", ref))
-        if ref == "e99":
-            raise PlaywrightError("Timeout 5000ms exceeded.\nCall log: ...")
-
-    def type_text(self, ref: str, text: str) -> None:
-        self.calls.append(("type_text", ref, text))
+def tokens(calls: int) -> dict[str, int]:
+    """The token totals FakeClient reports after `calls` model calls."""
+    return {
+        "input_tokens": calls * INPUT_TOKENS_PER_CALL,
+        "output_tokens": calls * OUTPUT_TOKENS_PER_CALL,
+    }
 
 
 def test_finish_returns_verdict() -> None:
@@ -106,6 +53,7 @@ def test_step_limit_reached() -> None:
         "status": "error",
         "reason": "step limit reached",
         "steps": 3,
+        **tokens(3),
     }
     assert len(client.calls) == 3
 
@@ -156,6 +104,7 @@ def test_failure_skips_rest_of_turn_including_finish() -> None:
         "status": "failed",
         "reason": "button broken",
         "steps": 2,
+        **tokens(2),
     }
     assert browser.calls == [("click", "e99")]
     results = client.history[2]["content"][:-1]
@@ -192,6 +141,7 @@ def test_malformed_finish_is_returned_as_error() -> None:
         "status": "passed",
         "reason": "retried with a reason",
         "steps": 2,
+        **tokens(2),
     }
     error_result = client.history[2]["content"][0]
     assert error_result["tool_use_id"] == "a"
@@ -239,7 +189,44 @@ def test_api_error_becomes_error_result() -> None:
         "status": "error",
         "reason": "Anthropic API error: Overloaded",
         "steps": 1,  # Only the first model call completed
+        **tokens(1),  # ...but what it spent is still reported
     }
+
+
+def test_tokens_add_up_across_calls() -> None:
+    client = FakeClient(
+        [
+            [tool_use("a", "click", ref="e1")],
+            [text("Thinking...")],
+            [tool_use("b", "finish", passed=True, reason="done")],
+        ]
+    )
+    result = _run_loop(client, FakeBrowser(), "goal", max_steps=5)
+    assert (result.input_tokens, result.output_tokens) == (300, 60)
+
+
+def test_on_step_receives_each_step_masked() -> None:
+    client = FakeClient(
+        [
+            [
+                tool_use("a", "type_text", ref="e5", text="hunter2"),
+                tool_use("b", "click", ref="e99"),
+            ],
+            [tool_use("c", "finish", passed=True, reason="done")],
+        ]
+    )
+    steps: list[tuple[int, str, dict[str, Any], str, bool]] = []
+
+    def on_step(*step: Any) -> None:
+        steps.append(step)
+
+    _run_loop(client, FakeBrowser(), "goal", max_steps=5, on_step=on_step)
+
+    assert steps == [
+        (1, "type_text", {"ref": "e5", "text": "••••"}, "Typed into e5.", False),
+        (1, "click", {"ref": "e99"}, "Error: Timeout 5000ms exceeded.", True),
+        (2, "finish", {"passed": True, "reason": "done"}, "run finished", False),
+    ]
 
 
 class FailingSession:
@@ -272,6 +259,7 @@ def test_run_agent_navigation_error(monkeypatch: pytest.MonkeyPatch) -> None:
         "status": "error",
         "reason": "Could not open https://shop.test: net::ERR_ABORTED (after 3 attempts)",
         "steps": 0,
+        **tokens(0),
     }
 
 

@@ -4,19 +4,21 @@ ASGITransport hands requests straight to the app, with no server or port involve
 """
 
 import uuid
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import Engine, delete
+from sqlalchemy import Engine
 from sqlalchemy.engine import URL
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import NullPool
 
+import argus.api
 from argus.api import app, get_session
-from argus.db import Run, RunStep
+from argus.celery_app import EXECUTE_RUN_TASK
+from argus.db import RunStep
 
 pytestmark = [pytest.mark.db, pytest.mark.anyio]
 
@@ -40,16 +42,32 @@ def override_session(url: URL) -> None:
     app.dependency_overrides[get_session] = get_test_session
 
 
-@pytest.fixture
-def clean_db(engine: Engine) -> Iterator[None]:
-    yield
-    with Session(engine) as session:
-        session.execute(delete(Run))  # Steps go too, via ON DELETE CASCADE
-        session.commit()
+class FakeSendTask:
+    """Stands in for celery_app.send_task: records each (task name, args) instead of
+    sending it to Redis. Set `error` to make it raise that error instead."""
+
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, list[Any]]] = []
+        self.error: Exception | None = None
+
+    def __call__(self, name: str, args: list[Any]) -> None:
+        if self.error is not None:
+            raise self.error
+        self.sent.append((name, args))
 
 
 @pytest.fixture
-async def client(test_url: URL, clean_db: None) -> AsyncIterator[AsyncClient]:
+def fake_send_task(monkeypatch: pytest.MonkeyPatch) -> FakeSendTask:
+    send_task = FakeSendTask()
+    monkeypatch.setattr(argus.api.celery_app, "send_task", send_task)
+    return send_task
+
+
+@pytest.fixture
+async def client(
+    test_url: URL, clean_db: None, fake_send_task: FakeSendTask
+) -> AsyncIterator[AsyncClient]:
+    # fake_send_task is requested here so no test can accidentally queue a real task.
     override_session(test_url)
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -81,6 +99,29 @@ async def test_create_run(client: AsyncClient) -> None:
     assert run["created_at"] is not None
     assert run["started_at"] is None
     assert run["finished_at"] is None
+
+
+async def test_create_run_queues_task(
+    client: AsyncClient, fake_send_task: FakeSendTask
+) -> None:
+    run = await create_run(client)
+    assert fake_send_task.sent == [(EXECUTE_RUN_TASK, [run["id"]])]
+
+
+async def test_create_run_when_queueing_fails(
+    client: AsyncClient, fake_send_task: FakeSendTask
+) -> None:
+    fake_send_task.error = ConnectionError("Redis is down")
+
+    run = await create_run(client)  # Still 202: the run was recorded
+
+    assert run["status"] == "error"
+    assert run["reason"] == "could not queue run"
+    assert run["finished_at"] is not None
+
+    # The error was saved, not just returned.
+    response = await client.get(f"/runs/{run['id']}")
+    assert response.json()["status"] == "error"
 
 
 async def test_get_run_with_steps_in_order(client: AsyncClient, engine: Engine) -> None:
