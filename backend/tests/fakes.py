@@ -83,3 +83,20 @@ class FakeBrowser:
 
     def type_text(self, ref: str, text: str) -> None:
         self.calls.append(("type_text", ref, text))
+
+
+class FakeRedis:
+    """Stands in for the worker's redis.Redis: records publish() calls.
+
+    Set `error` to make publish() raise it instead (to simulate Redis being down).
+    """
+
+    def __init__(self) -> None:
+        self.published: list[tuple[str, str]] = []
+        self.error: Exception | None = None
+
+    def publish(self, channel: str, message: str) -> int:
+        if self.error is not None:
+            raise self.error
+        self.published.append((channel, message))
+        return 0  # Number of subscribers that received it

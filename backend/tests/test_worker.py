@@ -4,6 +4,8 @@ A real worker would send the task through Redis. Calling the task function direc
 runs the same code synchronously, which is all these tests need.
 """
 
+import json
+import logging
 import time
 import uuid
 from datetime import UTC, datetime, timedelta
@@ -11,11 +13,13 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import redis
 from celery.exceptions import SoftTimeLimitExceeded
-from fakes import FakeBrowser, FakeClient, tool_use
+from fakes import FakeBrowser, FakeClient, FakeRedis, tool_use
 from sqlalchemy import Engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
+import argus.events
 import argus.worker
 from argus.agent import StepCallback, _run_loop
 from argus.db import Run
@@ -30,6 +34,19 @@ def use_test_db(
     engine: Engine, clean_db: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(argus.worker, "get_sessionmaker", lambda: sessionmaker(engine))
+
+
+@pytest.fixture(autouse=True)
+def fake_redis(monkeypatch: pytest.MonkeyPatch) -> FakeRedis:
+    """Every worker test publishes into this fake, never to a real Redis."""
+    fake = FakeRedis()
+    monkeypatch.setattr(argus.events, "get_redis", lambda: fake)
+    return fake
+
+
+def published_events(fake: FakeRedis, run_id: uuid.UUID) -> list[dict[str, Any]]:
+    assert all(channel == f"run:{run_id}" for channel, _ in fake.published)
+    return [json.loads(message) for _, message in fake.published]
 
 
 def scripted_agent(
@@ -257,3 +274,105 @@ def test_no_transaction_is_held_while_the_agent_runs(
 
     assert seen == [0, 0]
     assert load_run(engine, run_id).status == "passed"
+
+
+def test_events_are_published_after_each_change(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, fake_redis: FakeRedis
+) -> None:
+    scripted_agent(monkeypatch, LOGIN_TURNS)
+    run_id = add_run(engine)
+
+    execute_run(str(run_id))
+
+    sent = published_events(fake_redis, run_id)
+    assert [e["type"] for e in sent] == [
+        "status",
+        "step",
+        "step",
+        "step",
+        "step",
+        "finished",
+    ]
+    assert all(e["run_id"] == str(run_id) for e in sent)
+    assert sent[0]["data"]["status"] == "running"
+
+    run = load_run(engine, run_id)
+    # Each step event carries the saved step, including its database id.
+    assert [e["data"]["id"] for e in sent[1:5]] == [s.id for s in run.steps]
+    assert sent[2]["data"]["tool_input"] == {"ref": "e5", "text": "••••"}  # Masked
+    assert sent[-1]["data"] == {
+        "status": "passed",
+        "reason": "Logged in",
+        "step_count": 2,
+        "input_tokens": 200,
+        "output_tokens": 40,
+        "finished_at": run.finished_at.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def test_crashed_run_publishes_finished_error(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, fake_redis: FakeRedis
+) -> None:
+    failing_agent(monkeypatch, RuntimeError("boom"))
+    run_id = add_run(engine)
+
+    execute_run(str(run_id))
+
+    sent = published_events(fake_redis, run_id)
+    assert [e["type"] for e in sent] == ["status", "step", "finished"]
+    assert sent[-1]["data"]["status"] == "error"
+    assert sent[-1]["data"]["reason"] == "unexpected error: RuntimeError"
+    assert sent[-1]["data"]["step_count"] == 1  # Read back from the run
+
+
+def test_skipped_run_publishes_nothing(engine: Engine, fake_redis: FakeRedis) -> None:
+    run_id = add_run(engine, status="passed")
+    execute_run(str(run_id))
+    assert fake_redis.published == []
+
+
+def test_publish_failure_does_not_break_the_run(
+    engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_redis: FakeRedis,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    fake_redis.error = redis.ConnectionError("Redis is down")
+    scripted_agent(monkeypatch, LOGIN_TURNS)
+    run_id = add_run(engine)
+
+    execute_run(str(run_id))
+
+    run = load_run(engine, run_id)
+    assert run.status == "passed"
+    assert len(run.steps) == 4  # Everything was still saved
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 6  # One per event that couldn't be sent
+    assert "Could not publish status event" in warnings[0].getMessage()
+
+
+def test_publish_does_not_swallow_the_soft_time_limit(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch, fake_redis: FakeRedis
+) -> None:
+    # If the limit fires while publishing, the run must still stop and be marked.
+    # Celery raises it once, so only the first publish (the status event) fails.
+    real_publish = fake_redis.publish
+
+    def publish_hit_by_time_limit(channel: str, message: str) -> int:
+        monkeypatch.setattr(fake_redis, "publish", real_publish)
+        raise SoftTimeLimitExceeded()
+
+    monkeypatch.setattr(fake_redis, "publish", publish_hit_by_time_limit)
+    scripted_agent(monkeypatch, LOGIN_TURNS)
+    run_id = add_run(engine)
+
+    execute_run(str(run_id))
+
+    run = load_run(engine, run_id)
+    assert (run.status, run.reason) == ("error", "time limit exceeded")
+    assert run.steps == []  # The agent never started
+    finished = published_events(fake_redis, run_id)[-1]
+    assert (finished["type"], finished["data"]["reason"]) == (
+        "finished",
+        "time limit exceeded",
+    )

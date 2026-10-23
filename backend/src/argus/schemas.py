@@ -29,6 +29,7 @@ class RunStepOut(BaseModel):
     # from_attributes: build from an ORM object's attributes, not only from a dict.
     model_config = ConfigDict(from_attributes=True)
 
+    id: int  # Database id: increases with every step, so clients can order and dedupe
     step_number: int
     tool_name: str
     tool_input: dict[str, Any]

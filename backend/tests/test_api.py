@@ -8,15 +8,14 @@ from collections.abc import AsyncIterator
 from typing import Any
 
 import pytest
+from api_overrides import override_session
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import Engine
 from sqlalchemy.engine import URL
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import Session
-from sqlalchemy.pool import NullPool
 
 import argus.api
-from argus.api import app, get_session
+from argus.api import app
 from argus.celery_app import EXECUTE_RUN_TASK
 from argus.db import RunStep
 
@@ -26,20 +25,6 @@ pytestmark = [pytest.mark.db, pytest.mark.anyio]
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
-
-
-def override_session(url: URL) -> None:
-    """Point the API's session dependency at the database `url`."""
-    # NullPool: every test runs in its own event loop, and a pooled async
-    # connection can't be reused from a different loop.
-    engine = create_async_engine(url, poolclass=NullPool)
-    sessions = async_sessionmaker(engine, expire_on_commit=False)
-
-    async def get_test_session() -> AsyncIterator[AsyncSession]:
-        async with sessions() as session:
-            yield session
-
-    app.dependency_overrides[get_session] = get_test_session
 
 
 class FakeSendTask:
